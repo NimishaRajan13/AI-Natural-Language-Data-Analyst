@@ -1,0 +1,32 @@
+
+# API keys and private configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor and system files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local backups
+app_backup.py
+app_charts_backup.py
+app_insights_backup.py
+app_dashboard_backup.py
+app_five_tables_backup.py
+
+# Temporary files
+*.log
+*.tmp
