@@ -8,9 +8,8 @@ This project allows users to analyze e-commerce data using everyday English with
 
 ## 🚀 Live Demo
 
-**Try the application:** [AI Data Analyst — Streamlit](https://ai-natural-language-analyst.streamlit.app/)
+**Try the application:** [AI Data Analyst — Streamlit](https://ai-natural-language-data-analyst-pkdqck6phtcsptqvmlqt5v.streamlit.app/)
 
-*Update this link if your deployed Streamlit URL is different.*
 
 ## ✨ Key Features
 
