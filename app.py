@@ -26,6 +26,7 @@ MODEL = "gemini-3.1-flash-lite"
 
 MAX_ROWS = 100
 QUERY_TIMEOUT = 5
+MAX_AI_REQUESTS_PER_SESSION = 20
 
 st.set_page_config(
     page_title="AI Data Analyst | Dashboard",
@@ -487,12 +488,24 @@ else:
         placeholder="Which region has the highest order value?"
     )
 
-    if st.button("🔍 Analyze Data", type="primary"):
+    # Counts Gemini requests for both analysis and AI insights in this session.
+    if "ai_requests_used" not in st.session_state:
+        st.session_state["ai_requests_used"] = 0
+
+    remaining = max(0, MAX_AI_REQUESTS_PER_SESSION - st.session_state["ai_requests_used"])
+    st.caption(f"AI requests remaining this session: {remaining} / {MAX_AI_REQUESTS_PER_SESSION}")
+
+    if st.button(
+        "🔍 Analyze Data", type="primary",
+        disabled=remaining == 0,
+    ):
 
         if not question.strip():
             st.warning("Please enter a question.")
 
         else:
+            # Count the request before contacting Gemini, even if it fails.
+            st.session_state["ai_requests_used"] += 1
             try:
                 with st.spinner("Analyzing your data..."):
                     sql = generate_sql(question)
@@ -628,7 +641,12 @@ else:
         st.divider()
         st.subheader("🧠 AI Business Insights")
 
-        if st.button("✨ Generate AI Insights"):
+        if st.button(
+            "✨ Generate AI Insights",
+            disabled=(st.session_state["ai_requests_used"] >= MAX_AI_REQUESTS_PER_SESSION),
+        ):
+            # Insights also consume Gemini API quota.
+            st.session_state["ai_requests_used"] += 1
             try:
                 with st.spinner("Generating insights..."):
                     st.session_state["result_insights"] = (
