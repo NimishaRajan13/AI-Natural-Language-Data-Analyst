@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 
 import pandas as pd
@@ -157,84 +158,107 @@ def get_database_counts():
 # ==========================================
 
 ALLOWED_FUNCTIONS = {
-    "ROUND", "COALESCE", "ABS", "LOWER",
-    "UPPER", "SUBSTR", "STRFTIME", "DATE",
-    "SUM", "COUNT", "AVG", "MIN", "MAX"
+    "ROUND", "COALESCE", "IFNULL", "NULLIF", "ABS", "LOWER",
+    "UPPER", "SUBSTR", "LENGTH", "TRIM", "STRFTIME", "DATE",
+    "DATETIME", "JULIANDAY", "SUM", "COUNT", "AVG", "MIN", "MAX",
+    "TOTAL"
 }
 
+
 def validate_sql(sql):
-    statements = sqlglot.parse(sql, read="sqlite")
-
-    if len(statements) != 1:
-        raise ValueError("Only one SQL statement is allowed.")
-
-    query = statements[0]
-
-    if not isinstance(query, exp.Select):
-        raise ValueError("Only SELECT queries are allowed.")
-
-    # Reject comments.
+    """Conservatively validate the shape of a model-generated query."""
+    if not isinstance(sql, str) or not sql.strip() or len(sql) > 12000:
+        raise ValueError("SQL is empty or too long.")
     if "--" in sql or "/*" in sql or "*/" in sql:
         raise ValueError("SQL comments are not permitted.")
 
-    # Reject CTEs and subqueries.
-    if query.args.get("with_") or list(
-        query.find_all(exp.Subquery)
-    ):
-        raise ValueError(
-            "Subqueries and CTEs are not supported."
-        )
+    try:
+        statements = sqlglot.parse(sql, read="sqlite", error_level="RAISE")
+    except Exception as error:
+        raise ValueError("Invalid SQL syntax.") from error
 
-    # Block modification statements and commands.
-    blocked = (
-        exp.Insert, exp.Update, exp.Delete,
-        exp.Drop, exp.Alter, exp.Create,
-        exp.Command, exp.Pragma,
-        exp.Attach, exp.Detach
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise ValueError("Only one SELECT query is allowed.")
+    query = statements[0]
+
+    forbidden = (
+        exp.Subquery, exp.Union, exp.Intersect, exp.Except,
+        exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Alter,
+        exp.Create, exp.Command, exp.Pragma, exp.Attach, exp.Detach,
+        exp.Window, exp.Star
     )
-
+    # COUNT(*) is valid, but all other star expansions are blocked.
     for node in query.walk():
-        if isinstance(node, blocked):
-            raise ValueError("Unsafe SQL detected.")
+        if isinstance(node, forbidden):
+            if isinstance(node, exp.Star) and isinstance(node.parent, exp.Count):
+                continue
+            raise ValueError("Unsupported or unsafe SQL structure.")
+
+    if query.args.get("with_") or query.args.get("into"):
+        raise ValueError("CTEs and SELECT INTO are not permitted.")
+
+    tables = list(query.find_all(exp.Table))
+    if not tables or len(tables) > 5:
+        raise ValueError("Query must use between 1 and 5 tables.")
+    joins = list(query.find_all(exp.Join))
+    if len(joins) > 4:
+        raise ValueError("Too many JOIN operations.")
+    if any(j.args.get("kind", "").upper() == "CROSS" for j in joins):
+        raise ValueError("CROSS JOIN is not permitted.")
 
     aliases = {}
-
-    for table in query.find_all(exp.Table):
+    for table in tables:
         name = table.name.lower()
-
+        if table.args.get("db") or table.args.get("catalog"):
+            raise ValueError("Database-qualified table names are not permitted.")
         if name not in TABLE_COLUMNS:
-            raise ValueError(
-                f"Table not permitted: {name}"
-            )
-
+            raise ValueError(f"Table not permitted: {name}")
         alias = (table.alias or table.name).lower()
+        if alias in aliases:
+            raise ValueError("Duplicate table alias.")
         aliases[alias] = name
 
-    # Validate qualified columns.
     for column in query.find_all(exp.Column):
+        name = column.name.lower()
+        if column.args.get("db") or column.args.get("catalog"):
+            raise ValueError("Database-qualified columns are not permitted.")
         if column.table:
             alias = column.table.lower()
+            if alias not in aliases or name not in TABLE_COLUMNS[aliases[alias]]:
+                raise ValueError(f"Column not permitted: {column.sql()}")
+        else:
+            matches = sum(name in TABLE_COLUMNS[t] for t in aliases.values())
+            # An unqualified reference must match exactly one available table.
+            # Output aliases in ORDER BY are handled by SQLite's authorizer.
+            output_aliases = {
+                item.alias.lower() for item in query.expressions if item.alias
+            }
+            if matches != 1 and not (name in output_aliases and matches == 0):
+                raise ValueError(f"Unknown or ambiguous column: {name}")
 
-            if alias not in aliases:
-                raise ValueError(
-                    f"Unknown table alias: {alias}"
-                )
-
-            real_table = aliases[alias]
-
-            if column.name.lower() not in TABLE_COLUMNS[real_table]:
-                raise ValueError(
-                    f"Column not permitted: {column.sql()}"
-                )
-
-    # Check unsupported functions.
     for func in query.find_all(exp.Anonymous):
         if func.name.upper() not in ALLOWED_FUNCTIONS:
-            raise ValueError(
-                f"Function not permitted: {func.name}"
-            )
+            raise ValueError(f"Function not permitted: {func.name}")
 
     return query
+
+
+def readonly_authorizer(action, arg1, arg2, db_name, source):
+    """Enforce table, column and function permissions inside SQLite itself."""
+    if action == sqlite3.SQLITE_SELECT:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_READ:
+        table = (arg1 or "").lower()
+        column = (arg2 or "").lower()
+        if db_name == "main" and table in TABLE_COLUMNS:
+            # SQLite may report an empty column for COUNT(*)/existence checks.
+            if not column or column in TABLE_COLUMNS[table]:
+                return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION:
+        function_name = (arg2 or arg1 or "").upper()
+        if function_name in ALLOWED_FUNCTIONS:
+            return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
 
 
 # ==========================================
@@ -334,25 +358,23 @@ USER QUESTION:
 
 def execute_sql(sql):
     validate_sql(sql)
+    safe_sql = f"SELECT * FROM ({sql.strip().rstrip(';')}) LIMIT {MAX_ROWS}"
 
-    safe_sql = (
-        f"SELECT * FROM ({sql.rstrip(';')}) "
-        f"LIMIT {MAX_ROWS}"
-    )
-
-    with get_connection() as conn:
+    # A read-only connection, SQLite authorizer, and progress timeout provide
+    # independent protections beyond the model prompt and SQL parser.
+    with closing(get_connection()) as conn:
+        conn.set_authorizer(readonly_authorizer)
         started = time.monotonic()
 
         def progress_handler():
-            if time.monotonic() - started > QUERY_TIMEOUT:
-                return 1
-            return 0
+            return int(time.monotonic() - started > QUERY_TIMEOUT)
 
-        conn.set_progress_handler(
-            progress_handler, 1000
-        )
-
-        return pd.read_sql_query(safe_sql, conn)
+        conn.set_progress_handler(progress_handler, 1000)
+        try:
+            return pd.read_sql_query(safe_sql, conn)
+        finally:
+            conn.set_progress_handler(None, 0)
+            conn.set_authorizer(None)
 
 
 # ==========================================

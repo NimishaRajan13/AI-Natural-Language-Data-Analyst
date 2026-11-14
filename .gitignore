@@ -30,3 +30,4 @@ app_five_tables_backup.py
 # Temporary files
 *.log
 *.tmp
+app_before_security.py
